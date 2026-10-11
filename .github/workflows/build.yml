@@ -1,0 +1,114 @@
+name: Build & test
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: "8.7"
+
+      # Models are committed in app/src/main/assets/. These steps only run as
+      # a safety net if a checkout is missing or corrupted.
+      - name: Fetch object-detection model (if not committed)
+        run: |
+          mkdir -p app/src/main/assets
+          F=app/src/main/assets/detect.tflite
+          valid() { [ -f "$F" ] && [ "$(dd if="$F" bs=1 skip=4 count=4 2>/dev/null)" = "TFL3" ]; }
+          if valid; then
+            echo "detect.tflite already committed ($(wc -c < "$F") bytes) - no download needed"
+          else
+            rm -f "$F"; ok=0
+            for url in \
+              "https://cdn.jsdelivr.net/gh/am15h/object_detection_flutter@master/assets/detect.tflite" \
+              "https://raw.githubusercontent.com/am15h/object_detection_flutter/master/assets/detect.tflite"; do
+              echo "Trying: $url"
+              if curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$F" "$url" && valid; then
+                echo "Model OK: $(wc -c < "$F") bytes"; ok=1; break
+              fi
+              rm -f "$F"
+            done
+            [ "$ok" = "1" ] || { echo "::error::Could not obtain a valid detect.tflite"; exit 1; }
+          fi
+
+      - name: Fetch segmentation model (optional)
+        run: |
+          F=app/src/main/assets/deeplab_cityscapes.tflite
+          valid() { [ -f "$F" ] && [ "$(dd if="$F" bs=1 skip=4 count=4 2>/dev/null)" = "TFL3" ]; }
+          if ! valid; then
+            rm -f "$F"
+            for url in \
+              "https://raw.githubusercontent.com/google-coral/edgetpu/master/test_data/deeplabv3_mnv2_cityscapes_quant.tflite" \
+              "https://cdn.jsdelivr.net/gh/google-coral/edgetpu@master/test_data/deeplabv3_mnv2_cityscapes_quant.tflite"; do
+              echo "Trying: $url"
+              if curl -fL --retry 2 --connect-timeout 20 -o "$F" "$url" && valid; then
+                echo "Segmentation model OK: $(wc -c < "$F") bytes"; break
+              fi
+              rm -f "$F"
+            done
+            valid || echo "Segmentation model unavailable (optional) - continuing without it"
+          fi
+
+      - name: Unit tests
+        run: gradle testDebugUnitTest --stacktrace
+
+      - name: Lint
+        run: gradle lint
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: guidelens-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: lint-report
+          path: app/build/reports/lint-results*.html
+          if-no-files-found: ignore
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: "8.7"
+
+      - name: Build release APK (unsigned)
+        run: gradle assembleRelease --stacktrace
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: guidelens-release-unsigned-apk
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 90
+
+      # To ship signed builds: add a keystore as an encrypted secret and wire
+      # signingConfigs here, then attach the APK to a GitHub Release.

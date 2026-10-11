@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Safety disclaimer & limitations
+    url: https://github.com/doodle765/GuideLens#honest-limitations-safety-critical--read-this
+    about: Read this before filing a safety-related report
+  - name: Contributing guide
+    url: https://github.com/doodle765/GuideLens/blob/main/CONTRIBUTING.md
+    about: How to set up the project and what we expect in PRs
