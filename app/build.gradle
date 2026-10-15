@@ -56,7 +56,7 @@ dependencies {
     implementation 'androidx.camera:camera-lifecycle:1.3.4'
     implementation 'androidx.camera:camera-view:1.3.4'
 
-    implementation 'org.tensorflow:tensorflow-lite:2.14.0'
+    implementation 'org.tensorflow:tensorflow-lite:2.17.0'   // 2.17+: 16 KB-aligned native libs (Play requirement)
     implementation 'com.google.mlkit:text-recognition:16.0.1'   // bundled OCR model -> fully offline
     implementation 'com.google.android.gms:play-services-location:21.3.0'
     implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.8.4'
@@ -145,13 +145,15 @@ tasks.register('downloadModels') {
 // real .tflite files start with the flatbuffer magic "TFL3"
 ext.hasTflMagic = { File f ->
     if (f == null || !f.isFile() || f.length() < 8) return false
-    def fis = new java.io.FileInputStream(f)
+    def fis = new FileInputStream(f)   // java.io is auto-imported in Groovy
     try {
         byte[] skip = new byte[4]
         byte[] m = new byte[4]
         // flatbuffer layout: [u32 root offset][4-byte file id] - 'TFL3' is at bytes 4-7
         if (fis.read(skip) != 4) return false
-        return fis.read(m) == 4 && m[0] == 0x54 && m[1] == 0x46 && m[2] == 0x4C && m[3] == 0x33
+        return fis.read(m) == 4 &&
+                (m[0] & 0xFF) == 0x54 && (m[1] & 0xFF) == 0x46 &&
+                (m[2] & 0xFF) == 0x4C && (m[3] & 0xFF) == 0x33
     } finally {
         fis.close()
     }

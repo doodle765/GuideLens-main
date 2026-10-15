@@ -47,7 +47,7 @@ class Sonar {
             val u = urgency
             if (!muted && u > 0.03f) {
                 beep(freqHz = 620f + 520f * u, durMs = 70, volume = 0.45f, pan = pan)
-                sleepMs((1000L - 750L * u).coerceAtLeast(120L))
+                sleepMs((1000f - 750f * u).toLong().coerceAtLeast(120L))
             } else {
                 val now = System.currentTimeMillis()
                 if (!muted && now - lastBeat > 10_000L) {
