@@ -20,6 +20,9 @@ class PocketWatcher(
     private val prox = sm.getDefaultSensor(Sensor.TYPE_PROXIMITY)
 
     @Volatile private var registered = false
+    /** Last reported state — many proximity sensors stream events continuously;
+     *  we only report genuine near/far TRANSITIONS (and skip the initial event). */
+    @Volatile private var lastCovered: Boolean? = null
 
     fun start() {
         if (registered) return
@@ -29,12 +32,18 @@ class PocketWatcher(
     fun stop() {
         if (registered) sm.unregisterListener(this)
         registered = false
+        lastCovered = null
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) { }
 
     override fun onSensorChanged(e: SensorEvent) {
         if (e.sensor.type != Sensor.TYPE_PROXIMITY) return
-        onPocket(e.values[0] < e.sensor.maximumRange)
+        val covered = e.values[0] < e.sensor.maximumRange
+        val prev = lastCovered
+        if (prev == null || covered != prev) {
+            lastCovered = covered
+            onPocket(covered)
+        }
     }
 }

@@ -67,6 +67,7 @@ class CameraController(
         private set
 
     private var darkFrames = 0
+    private var brightFrames = 0
     private var darkLatch = false
 
     fun start() {
@@ -125,17 +126,26 @@ class CameraController(
 
             if (luma < DARK_LUMA) {
                 darkFrames++
+                brightFrames = 0
                 if (darkFrames >= DARK_FRAMES && !darkLatch) {
                     darkLatch = true
                     onStatus("Camera covered or too dark — detection paused.")
                     speaker.speak("It's too dark, or the camera is covered. I can't see anything.", priority = true)
                 }
             } else {
-                if (darkLatch && luma > RECOVER_LUMA) {
-                    darkLatch = false
-                    speaker.speak("I can see again. Detection resumed.")
-                }
                 darkFrames = 0
+                if (darkLatch) {
+                    brightFrames++
+                    // dwell: several consecutive bright frames above the threshold,
+                    // so dim indoor light can't flap the latch on and off
+                    if (luma > RECOVER_LUMA && brightFrames >= BRIGHT_FRAMES) {
+                        darkLatch = false
+                        brightFrames = 0
+                        speaker.speak("I can see again. Detection resumed.")
+                    }
+                } else {
+                    brightFrames = 0
+                }
             }
 
             if (darkLatch) {
@@ -248,6 +258,7 @@ class CameraController(
         private const val DARK_LUMA = 0.035f      // below: covered / very dark
         private const val RECOVER_LUMA = 0.09f    // hysteresis so it doesn't flap
         private const val DARK_FRAMES = 25        // ~2-3 s of dark frames before warning
+        private const val BRIGHT_FRAMES = 5       // consecutive bright frames to recover
     }
 }
 
