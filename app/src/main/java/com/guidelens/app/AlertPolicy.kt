@@ -39,12 +39,14 @@ class AlertPolicy(
     )
 
     private val state = HashMap<String, Stamp>()
-    private var lastClearSayAt = 0L
+    // Sentinel that never suppresses the first announcement: MIN_VALUE/2 so that
+    // `now - lastClearSayAt` cannot overflow for any realistic clock (real or test).
+    private var lastClearSayAt = Long.MIN_VALUE / 2
 
     /** Forget all tracked obstacles (camera covered / pocketed / restarted). */
     fun reset() {
         state.clear()
-        lastClearSayAt = 0L
+        lastClearSayAt = Long.MIN_VALUE / 2
     }
 
     internal fun multiplier(): Float = when (sensitivity) {
