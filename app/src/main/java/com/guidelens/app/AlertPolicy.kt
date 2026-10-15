@@ -86,7 +86,7 @@ class AlertPolicy(
 
         // ---- first sighting of this object+side ----
         if (existing == null) {
-            val st = Stamp(dist = dist, t = now, seen = now)
+            val st = Stamp(dist = dist, t = now, seen = now, lastApproachDist = dist)
             state[key] = st
             if (dist <= 5f) { st.wasClose = true; st.clearAnnounced = false }
             return when {

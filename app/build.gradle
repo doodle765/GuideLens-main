@@ -84,8 +84,8 @@ tasks.register('downloadModels') {
         } else {
             if (det.exists()) det.delete()
             def urls = [
-                    'https://github.com/am15h/object_detection_flutter/raw/master/assets/detect.tflite',
-                    'https://raw.githubusercontent.com/am15h/object_detection_flutter/master/assets/detect.tflite'
+                'https://github.com/am15h/object_detection_flutter/raw/master/assets/detect.tflite',
+                'https://raw.githubusercontent.com/am15h/object_detection_flutter/master/assets/detect.tflite'
             ]
             for (u in urls) {
                 try {
@@ -109,9 +109,9 @@ tasks.register('downloadModels') {
 
         if (!det.isFile() || !hasTflMagic(det)) {
             throw new GradleException(
-                    'Missing object-detection model app/src/main/assets/detect.tflite.\n' +
-                            'Fix: download from https://github.com/am15h/object_detection_flutter/raw/master/assets/detect.tflite\n' +
-                            '     and commit it as app/src/main/assets/detect.tflite')
+                'Missing object-detection model app/src/main/assets/detect.tflite.\n' +
+                'Fix: download from https://github.com/am15h/object_detection_flutter/raw/master/assets/detect.tflite\n' +
+                '     and commit it as app/src/main/assets/detect.tflite')
         }
 
         // optional segmentation model (never fails the build)
@@ -119,8 +119,8 @@ tasks.register('downloadModels') {
         if (!seg.isFile() || !hasTflMagic(seg)) {
             if (seg.exists()) seg.delete()
             def segUrls = [
-                    'https://raw.githubusercontent.com/google-coral/edgetpu/master/test_data/deeplabv3_mnv2_cityscapes_quant.tflite',
-                    'https://tfhub.dev/tensorflow/lite-model/deeplabv3/1/metadata/2?lite-format=tflite'
+                'https://raw.githubusercontent.com/google-coral/edgetpu/master/test_data/deeplabv3_mnv2_cityscapes_quant.tflite',
+                'https://tfhub.dev/tensorflow/lite-model/deeplabv3/1/metadata/2?lite-format=tflite'
             ]
             for (u in segUrls) {
                 try {
