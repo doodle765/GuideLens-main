@@ -1,454 +1,524 @@
 package com.guidelens.app
 
 import android.Manifest
-import android.content.Context
+import android.annotation.SuppressLint
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.location.Location
+import android.graphics.Bitmap
+import android.graphics.drawable.Drawable
 import android.net.Uri
-import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.SpannableString
-import android.text.Spanned
-import android.text.style.ForegroundColorSpan
-import android.text.style.RelativeSizeSpan
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.provider.Settings
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.text.Editable
+import android.text.TextWatcher
+import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
-import android.widget.RadioButton
+import android.view.WindowManager
+import android.widget.EditText
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.appcompat.app.AppCompatDelegate
+import androidx.cardview.widget.CardView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.button.MaterialButton
-import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.google.android.material.slider.Slider
+import com.google.android.material.materialswitch.MaterialSwitch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.math.roundToInt
+import java.util.Locale
 
+/**
+ * GuideLens — voice-first assistive app for blind & elderly users.
+ *
+ * UX wiring highlights:
+ *  - detection auto-starts on launch (a blind user can't tap a button to begin)
+ *  - double-tap anywhere repeats the last spoken message
+ *  - periodic OCR reads signs in detection mode ("Sign says: …") and the
+ *    "read this" button uses the same camera frames — not PreviewView.getBitmap()
+ *  - pocket pause (proximity) and a covered-lens/dark watchdog keep alerts honest
+ *  - first run: safety disclaimer, then a spoken tutorial (holding the phone,
+ *    overhang limitation, one-earbud guidance, voice commands)
+ */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var prefs: Prefs
     private lateinit var speaker: Speaker
-    private lateinit var voice: VoiceController
-    private lateinit var alerts: AlertCenter
-    private lateinit var camera: CameraController
     private lateinit var ocr: OcrReader
-    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var voice: VoiceController
+    private lateinit var geo: Geo
+    private lateinit var vibrator: Vibrator
+    private lateinit var alerts: AlertCenter
 
-    private var position: Location? = null
-    private var nav: Geo.Route? = null
-
-    // ---- views ----
-    private lateinit var scrHome: View
-    private lateinit var scrNav: View
-    private lateinit var scrCamera: View
-    private lateinit var scrSos: View
-    private lateinit var scrSettings: View
-    private lateinit var gpsChip: com.google.android.material.chip.Chip
-    private lateinit var battChip: com.google.android.material.chip.Chip
-    private lateinit var themeBtn: MaterialButton
+    private lateinit var homeView: View
+    private lateinit var cameraView: View
+    private lateinit var navView: View
     private lateinit var navStatus: TextView
+    private lateinit var readView: View
+    private lateinit var sosView: View
+    private lateinit var settingsView: View
+    private lateinit var aboutView: View
     private lateinit var camStatus: TextView
-    private lateinit var previewView: androidx.camera.view.PreviewView
-    private lateinit var overlayView: OverlayView
+    private lateinit var navEta: TextView
+    private lateinit var scroller: ScrollView
 
-    private val screens: Map<String, View> by lazy {
-        mapOf("home" to scrHome, "nav" to scrNav, "camera" to scrCamera,
-              "sos" to scrSos, "settings" to scrSettings)
+    private lateinit var btnHome: MaterialButton
+    private lateinit var btnNav: MaterialButton
+    private lateinit var btnSos: MaterialButton
+    private lateinit var btnSettings: MaterialButton
+    private lateinit var btnVoice: MaterialButton
+
+    private lateinit var previewView: androidx.camera.view.PreviewView
+    private lateinit var overlay: OverlayView
+
+    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var camera: CameraController
+
+    private val PERMS = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO, Manifest.permission.ACCESS_FINE_LOCATION)
+    private val REQ_PERMS = 101
+    private val REQ_CAM = 102
+    private val REQ_MIC = 103
+
+    private var recognizer: SpeechRecognizer? = null
+    private var listening = false
+    private var activeNav: Geo.Route? = null
+
+    // ---- new UX state ----
+    private lateinit var sonar: Sonar
+    private lateinit var tapDetector: GestureDetector
+    private lateinit var pocketWatcher: PocketWatcher
+    private lateinit var fallDetector: FallDetector
+    private var cameraStartedOnce = false
+    private var ocrBusy = false
+    private var lastOcrNorm = ""
+    private var lastOcrAt = 0L
+    private var fallCancel: Runnable? = null
+
+    private val ocrRunnable = object : Runnable {
+        override fun run() {
+            if (camera.running && !ocrBusy) {
+                val bmp = camera.lastFrame
+                if (bmp != null) {
+                    ocrBusy = true
+                    val snap = Bitmap.createScaledBitmap(bmp, bmp.width, bmp.height, false)
+                    lifecycleScope.launch {
+                        val text = withContext(Dispatchers.IO) { ocr.read(snap) }
+                        ocrBusy = false
+                        if (text.isNotBlank()) maybeAnnounceSign(text)
+                    }
+                }
+            }
+            handler.postDelayed(this, 4000)
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        prefs = Prefs(this)
-        AppCompatDelegate.setDefaultNightMode(
-            if (prefs.themeDark) AppCompatDelegate.MODE_NIGHT_YES else AppCompatDelegate.MODE_NIGHT_NO)
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        prefs = Prefs(this)
+        applyTheme()
         setContentView(R.layout.activity_main)
 
-        speaker = Speaker(this, prefs)
-        voice = VoiceController(this,
-            onCommand = { runOnUiThread { handleCommand(it) } },
-            onError = { runOnUiThread { speaker.speak("Sorry, I didn't catch that. Try again.") } })
-        alerts = AlertCenter(speaker, prefs, AlertCenter.vibratorOf(this))
+        vibrator = getSystemService(VIBRATOR_SERVICE) as Vibrator
+        alerts = AlertCenter(
+            speaker = speakerInit(),
+            prefs = prefs,
+            vibrator = vibrator
+        )
         ocr = OcrReader()
+        voice = VoiceController(this)
+        geo = Geo()
+        sonar = Sonar()
 
         bindViews()
+        twoLine(btnNav, "Navigate somewhere")
+        twoLine(btnSos, "SOS - alert my contact")
+        twoLine(btnSettings, "Settings")
         styleButtons()
         applySimpleMode()
 
-        camera = CameraController(this, previewView, overlayView, prefs, speaker, alerts) { msg ->
-            runOnUiThread { camStatus.text = msg }
-        }
-
+        show("home")
+        syncThemeIcon()
         wireButtons()
+        startGeo()
         loadSettingsUI()
         updateBatteryChip()
-        startGeo()
 
-        if (!prefs.agreed) showDisclaimer()
-        if (!voice.isSupported) {
-            speaker.speak("Voice input is not supported on this device. Use the big buttons instead.")
+        tapDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                speaker.repeat()
+                return true
+            }
+        })
+
+        pocketWatcher = PocketWatcher(this) { covered ->
+            runOnUiThread {
+                alerts.setMuted(covered)
+                sonar.muted = covered
+                if (covered) speaker.speak("Phone covered. Detection paused.")
+                else speaker.speak("Detection resumed.")
+            }
         }
+
+        fallDetector = FallDetector(this) { runOnUiThread { onFallDetected() } }
+
+        if (!allGranted(PERMS)) {
+            ActivityCompat.requestPermissions(this, PERMS, REQ_PERMS)
+        }
+
+        // detection is the point of the app: start it without waiting for a tap
+        handler.postDelayed({ startCamera() }, 700)
+        handler.postDelayed(ocrRunnable, 6000)
+        showDisclaimer()
     }
 
-    // ================= views =================
+    private fun speakerInit(): Speaker {
+        speaker = Speaker(this, prefs)
+        return speaker
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) cancelFallCountdownIfAny()
+        tapDetector.onTouchEvent(ev)
+        return super.dispatchTouchEvent(ev)
+    }
+
     private fun bindViews() {
-        scrHome = findViewById(R.id.scrHome)
-        scrNav = findViewById(R.id.scrNav)
-        scrCamera = findViewById(R.id.scrCamera)
-        scrSos = findViewById(R.id.scrSOS)
-        scrSettings = findViewById(R.id.scrSettings)
-        gpsChip = findViewById(R.id.gpsChip)
-        battChip = findViewById(R.id.battChip)
-        themeBtn = findViewById(R.id.themeBtn)
+        homeView = findViewById(R.id.homeView)
+        cameraView = findViewById(R.id.cameraView)
+        navView = findViewById(R.id.navView)
         navStatus = findViewById(R.id.navStatus)
+        readView = findViewById(R.id.readView)
+        sosView = findViewById(R.id.sosView)
+        settingsView = findViewById(R.id.settingsView)
+        aboutView = findViewById(R.id.aboutView)
         camStatus = findViewById(R.id.camStatus)
-        previewView = findViewById(R.id.previewView)
-        overlayView = findViewById(R.id.overlayView)
+        navEta = findViewById(R.id.navEta)
+        scroller = findViewById(R.id.scroller)
 
-        // brand: "Guide" in text color + "Lens" in accent
-        val brand = findViewById<TextView>(R.id.brand)
-        val ss = SpannableString("GuideLens")
-        ss.setSpan(ForegroundColorSpan(ContextCompat.getColor(this, R.color.accent)), 5, 9, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        brand.text = ss
+        btnHome = findViewById(R.id.btnHome)
+        btnNav = findViewById(R.id.btnNav)
+        btnSos = findViewById(R.id.btnSos)
+        btnSettings = findViewById(R.id.btnSettings)
+        btnVoice = findViewById(R.id.btnVoice)
+        previewView = findViewById(R.id.previewView)
+        overlay = findViewById(R.id.overlayView)
     }
 
-    private fun twoLine(main: String, sub: String): CharSequence {
-        val s = SpannableString(main + "\n" + sub)
-        val start = main.length + 1
-        s.setSpan(RelativeSizeSpan(0.72f), start, s.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        s.setSpan(ForegroundColorSpan(ContextCompat.getColor(this, R.color.text2)), start, s.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-        return s
+    private fun twoLine(btn: MaterialButton, text: String) {
+        val parts = text.split(" - ", limit = 2)
+        if (parts.size == 2) {
+            val title = parts[0].trim()
+            val subtitle = parts[1].trim()
+            val sp = android.text.SpannableString("$title\n$subtitle")
+            sp.setSpan(android.text.style.AbsoluteSizeSpan(13, true), title.length + 1, sp.length, 0)
+            sp.setSpan(android.text.style.ForegroundColorSpan(android.graphics.Color.parseColor("#B9BDC7")), title.length + 1, sp.length, 0)
+            btn.text = sp
+        } else {
+            btn.text = text
+        }
     }
 
     private fun styleButtons() {
-        findViewById<MaterialButton>(R.id.btnTalk).text =
-            twoLine("Hold to Talk", "Say \u201Chelp\u201D anytime")
-        findViewById<MaterialButton>(R.id.btnNavigate).text =
-            twoLine("Navigate somewhere", "Voice-guided walking route")
-        findViewById<MaterialButton>(R.id.btnDetect).text =
-            twoLine("Obstacle detection", "Poles, walls, people & more")
-        findViewById<MaterialButton>(R.id.btnWhereAmI).text =
-            twoLine("Where am I?", "Speaks your current address")
-        findViewById<MaterialButton>(R.id.btnSettings).text =
-            twoLine("Settings", "Voice, alerts, contact")
-        findViewById<MaterialButton>(R.id.btnMore).text =
-            twoLine("More options", "Extra features & settings")
-        findViewById<MaterialButton>(R.id.btnSOS).text =
-            twoLine("Emergency SOS", "Text your location to a contact")
+        val ids = intArrayOf(R.id.btnStartCamera, R.id.btnWhereAmI, R.id.btnNavigate,
+            R.id.btnReadSign, R.id.btnVoice, R.id.btnStopNav, R.id.btnDescribe, R.id.btnStopCam,
+            R.id.btnCallContact, R.id.btnSmsContact, R.id.btnTestSOS, R.id.btnSendSOS,
+            R.id.btnBackSOS, R.id.btnSaveSettings, R.id.btnBackSettings, R.id.btnOpenTtsSettings,
+            R.id.btnBackAbout, R.id.btnHome, R.id.btnNav, R.id.btnSos, R.id.btnSettings)
+        for (id in ids) {
+            val b = findViewById<View>(id) as? MaterialButton ?: continue
+            b.cornerRadius = 28
+            b.setPadding(24, 18, 24, 18)
+        }
     }
 
     private fun applySimpleMode() {
         val simple = prefs.simple
-        findViewById<View>(R.id.btnSettings).visibility = if (simple) View.GONE else View.VISIBLE
-        findViewById<View>(R.id.duoRow).visibility = if (simple) View.GONE else View.VISIBLE
-        findViewById<View>(R.id.btnMore).visibility = if (simple) View.VISIBLE else View.GONE
-
-        val talk = findViewById<MaterialButton>(R.id.btnTalk)
-        talk.textSize = if (simple) 27f else 23f
-        talk.minimumHeight = if (simple) (128 * resources.displayMetrics.density).toInt() else talk.minimumHeight
-
-        val hero = findViewById<TextView>(R.id.heroLine)
-        hero.textSize = if (simple) 25f else 21f
+        listOf(R.id.btnReadSign, R.id.btnSettings, R.id.btnOpenTtsSettings,
+            R.id.rowTheme, R.id.cardModes, R.id.cardVoice, R.id.cardNav,
+            R.id.cardRead, R.id.cardTts, R.id.cardAbout).forEach { id ->
+            findViewById<View>(id)?.visibility = if (simple) View.GONE else View.VISIBLE
+        }
+        findViewById<View>(R.id.btnTestSOS)?.visibility = if (simple) View.GONE else View.VISIBLE
     }
 
     private fun show(name: String) {
-        screens.values.forEach { it.visibility = View.GONE }
-        screens[name]?.visibility = View.VISIBLE
-        findViewById<View>(R.id.scroller).scrollTo(0, 0)
-    }
+        homeView.visibility = if (name == "home") View.VISIBLE else View.GONE
+        cameraView.visibility = if (name == "camera") View.VISIBLE else View.GONE
+        navView.visibility = if (name == "nav") View.VISIBLE else View.GONE
+        readView.visibility = if (name == "read") View.VISIBLE else View.GONE
+        sosView.visibility = if (name == "sos") View.VISIBLE else View.GONE
+        settingsView.visibility = if (name == "settings") View.VISIBLE else View.GONE
+        aboutView.visibility = if (name == "about") View.VISIBLE else View.GONE
 
-    // ================= wiring =================
-    private fun wireButtons() {
-        val talk = findViewById<MaterialButton>(R.id.btnTalk)
-        talk.setOnTouchListener { _, ev ->
-            when (ev.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    if (hasPermissions(Manifest.permission.RECORD_AUDIO)) {
-                        ensureLocation { voice.start() }
-                    } else {
-                        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
-                    }
-                    true
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { voice.stop(); true }
-                else -> false
-            }
+        val title = when (name) {
+            "home" -> "GuideLens"
+            "camera" -> "Obstacle detection"
+            "nav" -> "Navigate"
+            "read" -> "Read for me"
+            "sos" -> "SOS"
+            "settings" -> "Settings"
+            "about" -> "About"
+            else -> "GuideLens"
         }
-
-        themeBtn.setOnClickListener {
-            prefs.themeDark = !prefs.themeDark
-            AppCompatDelegate.setDefaultNightMode(
-                if (prefs.themeDark) AppCompatDelegate.MODE_NIGHT_YES else AppCompatDelegate.MODE_NIGHT_NO)
-            syncThemeIcon()
-            speaker.speak(if (prefs.themeDark) "Dark mode on." else "Light mode on.")
-        }
-        findViewById<MaterialButton>(R.id.simpleBtn).setOnClickListener {
-            prefs.simple = !prefs.simple
-            applySimpleMode()
-            speaker.speak(if (prefs.simple) "Simple view on. Bigger buttons, fewer options."
-                          else "Standard view on.")
-        }
-
-        findViewById<MaterialButton>(R.id.btnNavigate).setOnClickListener { show("nav") }
-        findViewById<MaterialButton>(R.id.navBack).setOnClickListener { stopNavigation(silent = true); show("home") }
-        findViewById<MaterialButton>(R.id.navGo).setOnClickListener {
-            val q = findViewById<com.google.android.material.textfield.TextInputEditText>(R.id.navDestInput)
-                .text?.toString()?.trim().orEmpty()
-            if (q.isNotEmpty()) navigateTo(q) else speaker.speak("Please type or say a destination first.")
-        }
-        findViewById<MaterialButton>(R.id.navStop).setOnClickListener { stopNavigation() }
-
-        findViewById<MaterialButton>(R.id.btnDetect).setOnClickListener { show("camera"); startCamera() }
-        findViewById<MaterialButton>(R.id.camStop).setOnClickListener { stopCameraAndHome() }
-        findViewById<MaterialButton>(R.id.camStopTop).setOnClickListener { stopCameraAndHome() }
-
-        findViewById<MaterialButton>(R.id.btnWhereAmI).setOnClickListener { whereAmI() }
-        findViewById<MaterialButton>(R.id.btnAround).setOnClickListener { describeAround() }
-        findViewById<MaterialButton>(R.id.btnRead).setOnClickListener { readSign() }
-
-        findViewById<MaterialButton>(R.id.btnSOS).setOnClickListener { sosFlow() }
-        findViewById<MaterialButton>(R.id.sosBack).setOnClickListener { show("home") }
-        findViewById<MaterialButton>(R.id.sosSend).setOnClickListener { sendSOS() }
-
-        findViewById<MaterialButton>(R.id.btnSettings).setOnClickListener { show("settings") }
-        findViewById<MaterialButton>(R.id.btnMore).setOnClickListener { show("settings") }
-        findViewById<MaterialButton>(R.id.setBack).setOnClickListener { show("home") }
-
-        findViewById<Slider>(R.id.setRate).addOnChangeListener { _, v, _ ->
-            findViewById<TextView>(R.id.rateLabel).text = "Speech speed  %.1f\u00D7".format(v)
-        }
-        findViewById<MaterialButton>(R.id.btnSaveSettings).setOnClickListener { saveSettings() }
-        findViewById<MaterialButton>(R.id.btnTestVoice).setOnClickListener {
-            speaker.speak("This is how GuideLens sounds. You can change the speed in settings.", priority = true)
-        }
+        supportActionBar?.title = title
+        scroller.post { scroller.scrollTo(0, 0) }
     }
 
     private fun syncThemeIcon() {
-        themeBtn.setIconResource(if (prefs.themeDark) R.drawable.ic_moon else R.drawable.ic_sun)
+        val icon = if (prefs.themeDark) R.drawable.ic_moon else R.drawable.ic_sun
+        try {
+            val d: Drawable? = androidx.core.content.ContextCompat.getDrawable(this, icon)
+            findViewById<MaterialButton>(R.id.btnToggleTheme)?.icon = d
+        } catch (e: Exception) {
+        }
     }
 
-    // ================= permissions =================
-    private fun hasPermissions(vararg ps: String): Boolean =
-        ps.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
-
-    private fun ensureLocation(then: () -> Unit = {}) {
-        if (hasPermissions(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)) {
-            then()
-        } else {
-            ActivityCompat.requestPermissions(this,
-                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
-                REQ_LOC)
+    private fun wireButtons() {
+        findViewById<View>(R.id.btnWhereAmI).setOnClickListener { whereAmI() }
+        findViewById<View>(R.id.btnStartCamera).setOnClickListener { show("camera"); startCamera() }
+        findViewById<View>(R.id.btnDescribe).setOnClickListener { describeAround() }
+        findViewById<View>(R.id.btnStopCam).setOnClickListener { stopCameraAndHome() }
+        findViewById<View>(R.id.btnNavigate).setOnClickListener { show("nav") }
+        findViewById<View>(R.id.btnStopNav).setOnClickListener { stopNavigation() }
+        findViewById<View>(R.id.btnReadSign).setOnClickListener { readSign() }
+        findViewById<View>(R.id.btnCallContact).setOnClickListener { callContact() }
+        findViewById<View>(R.id.btnSmsContact).setOnClickListener { smsContact() }
+        findViewById<View>(R.id.btnTestSOS).setOnClickListener {
+            vibrateSosPattern()
+            speaker.speak("SOS test. Both sound and vibration are working.")
         }
+        findViewById<View>(R.id.btnSendSOS).setOnClickListener { sendSOS() }
+        findViewById<View>(R.id.btnBackSOS).setOnClickListener { show("home") }
+        findViewById<View>(R.id.btnSaveSettings).setOnClickListener { saveSettings(); show("home") }
+        findViewById<View>(R.id.btnBackSettings).setOnClickListener { show("home") }
+        findViewById<View>(R.id.btnOpenTtsSettings).setOnClickListener {
+            try {
+                val i = Intent("com.android.settings.TTS_SETTINGS")
+                startActivity(i)
+            } catch (e: Exception) {
+                Toast.makeText(this, "TTS settings not available", Toast.LENGTH_SHORT).show()
+            }
+        }
+        findViewById<View>(R.id.btnBackAbout).setOnClickListener { show("home") }
+        btnNav.setOnClickListener { show("nav") }
+        btnSos.setOnClickListener { show("sos") }
+        btnSettings.setOnClickListener { show("settings") }
+        btnHome.setOnClickListener { show("home") }
+        findViewById<View>(R.id.btnToggleTheme)?.setOnClickListener {
+            prefs.themeDark = !prefs.themeDark
+            applyTheme()
+            syncThemeIcon()
+        }
+        btnVoice.setOnClickListener {
+            if (listening) {
+                try { recognizer?.stopListening() } catch (e: Exception) { }
+                return@setOnClickListener
+            }
+            micPermissionThen { startListening() }
+        }
+
+        val et = findViewById<EditText>(R.id.etDestination)
+        findViewById<View>(R.id.btnGo).setOnClickListener {
+            val q = et.text.toString().trim()
+            if (q.isEmpty()) {
+                speaker.speak("Please type or say where you want to go.")
+            } else {
+                navigateTo(q)
+            }
+        }
+    }
+
+    private fun applyTheme() {
+        if (prefs.themeDark) setTheme(R.style.Theme_GuideLens) else setTheme(R.style.Theme_GuideLens_Light)
+    }
+
+    private fun allGranted(perms: Array<String>): Boolean {
+        for (p in perms) {
+            if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) return false
+        }
+        return true
     }
 
     private fun startCamera() {
-        if (hasPermissions(Manifest.permission.CAMERA)) {
-            camera.start()
-        } else {
+        cameraStartedOnce = true
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), REQ_CAM)
+            return
         }
+        if (!::camera.isInitialized) {
+            camera = CameraController(this, previewView, overlay, prefs, speaker, alerts, sonar) { msg ->
+                camStatus.text = msg
+            }
+        }
+        camera.start()
+        sonar.start()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         when (requestCode) {
-            REQ_CAM -> if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) camera.start()
-            REQ_LOC -> startGeo()
-            else -> { }
+            REQ_PERMS -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) startGeo()
+            }
+            REQ_CAM -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) camera.start()
+                else speaker.speak("Camera permission was denied. Obstacle detection will not work.")
+            }
+            REQ_MIC -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) startListening()
+                else speaker.speak("Microphone permission was denied. Voice commands will not work.")
+            }
         }
     }
 
-    // ================= geo =================
+    @SuppressLint("MissingPermission")
     private fun startGeo() {
-        if (!hasPermissions(Manifest.permission.ACCESS_FINE_LOCATION)) {
-            gpsChip.text = " GPS"
-            ensureLocation { startGeo() }
-            return
-        }
-        val fused = com.google.android.gms.location.LocationServices.getFusedLocationProviderClient(this)
-        val req = com.google.android.gms.location.LocationRequest.Builder(
-            com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY, 1000L).build()
-        try {
-            fused.requestLocationUpdates(req, object : com.google.android.gms.location.LocationCallback() {
-                override fun onLocationResult(result: com.google.android.gms.location.LocationResult) {
-                    result.lastLocation?.let { loc ->
-                        position = loc
-                        gpsChip.text = " \u00B1" + loc.accuracy.roundToInt() + " m"
-                        navTick()
-                    }
-                }
-            }, Looper.getMainLooper())
-        } catch (e: SecurityException) {
-            gpsChip.text = " permission needed"
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            geo.start(this)
         }
     }
 
     private fun whereAmI() {
-        val p = position
-        if (p == null) {
-            speaker.speak("I don't have your location yet. Please allow location access.")
-            return
-        }
-        // Offline-first: say the no-internet message, exactly as specified.
-        if (!isOnline(this)) {
-            speaker.speak("No internet access. I can't tell you where you are right now.", priority = true)
-            return
-        }
-        speaker.speak("Getting your location\u2026")
         lifecycleScope.launch {
-            val text = withContext(Dispatchers.IO) { Geo.whereAmIText(this@MainActivity, p) }
-            when (text) {
-                "NO_INTERNET" -> speaker.speak("No internet access. I can't tell you where you are right now.", priority = true)
-                "COORDS" -> speaker.speak("You are at coordinates %.5f, %.5f.".format(p.latitude, p.longitude))
-                else -> speaker.speak("You are at $text. GPS accuracy about ${p.accuracy.roundToInt()} meters.")
-            }
-        }
-    }
-
-    // ================= navigation =================
-    private fun navigateTo(place: String) {
-        val p = position
-        if (p == null) {
-            speaker.speak("I need your location first. Please allow location access.")
-            return
-        }
-        // Walking routes require internet (map data lives on OSM/OSRM servers).
-        if (!isOnline(this)) {
-            speaker.speak("Navigation needs an internet connection to download the walking route. Everything else works offline.", priority = true)
-            return
-        }
-        speaker.speak("Looking for $place\u2026")
-        lifecycleScope.launch {
-            val dest = Geo.geocode(place)
-            if (dest == null) {
-                speaker.speak("Sorry, I couldn't find $place. Try a nearby landmark or a full address.")
-                return@launch
-            }
-            val route = Geo.fetchRoute(LatLng(p.latitude, p.longitude), dest)
-            if (route == null) {
-                speaker.speak("I couldn't find a walking route there. Please try again.")
-                return@launch
-            }
-            nav = route
-            show("nav")
-            val len = Geo.routeLen(route.coords)
-            navStatus.text = "Route to ${dest.label} \u2014 ${len.roundToInt()} m."
-            speaker.speak("Route set to ${dest.label}. About ${len.roundToInt()} meters, roughly " +
-                    "${(len / 80).roundToInt().coerceAtLeast(1)} minutes walking. Say 'stop' anytime.")
-            vibrateSosPattern(short = true)
-        }
-    }
-
-    private fun navTick() {
-        val n = nav ?: return
-        val p = position ?: return
-        val here = LatLng(p.latitude, p.longitude)
-        val steps = n.steps
-        if (n.stepIdx >= steps.size) { finishNav(); return }
-        val step = steps[n.stepIdx]
-        val end = LatLng(step.lat, step.lng)
-        val d = Geo.hav(here, end)
-
-        if (Geo.hav(here, LatLng(n.dest.lat, n.dest.lng)) < 20.0) { finishNav(); return }
-
-        while (n.stepIdx < steps.size - 1 && d < 8.0) {
-            n.stepIdx++
-            n.announcedPre = false
-            n.announcedNow = false
-            return navTick()
-        }
-
-        if (!n.announcedPre && d < 22.0 && d >= 6.0) {
-            n.announcedPre = true
-            val pre = if (d > 12.0) "In about ${((d / 5).roundToInt() * 5)} meters, " else ""
-            speaker.speak(pre + Geo.maneuverText(step) + ".")
-            vibrateSosPattern(short = true)
-        }
-        if (!n.announcedNow && d < 6.0) {
-            n.announcedNow = true
-            speaker.speak("Now. " + Geo.maneuverText(step) + ".", priority = true)
-        }
-
-        val off = Geo.nearestDistToRoute(here, n.coords)
-        if (off > 35.0 && System.currentTimeMillis() - n.lastRecalc > 15000) {
-            n.lastRecalc = System.currentTimeMillis()
-            speaker.speak("You seem off the route. Recalculating.", priority = true)
-            vibrateLong()
-            val dest = n.dest
-            lifecycleScope.launch {
-                val r = Geo.fetchRoute(here, dest)
-                if (r != null) {
-                    nav = r
-                    r.lastRecalc = System.currentTimeMillis()
+            val d = geo.whereAmI()
+            val text = when {
+                d.isOnline == false && d.name.isEmpty() -> {
+                    "No internet access. I can't tell you where you are right now."
                 }
+                d.name.isNotEmpty() -> {
+                    val lat = String.format("%.4f", d.lat)
+                    val lon = String.format("%.4f", d.lon)
+                    "${d.name}. Approximate coordinates: latitude $lat, longitude $lon."
+                }
+                else -> "I can't determine your exact address, but your approximate coordinates are " +
+                        "${String.format("%.4f", d.lat)}, ${String.format("%.4f", d.lon)}."
+            }
+            speaker.speak(text)
+            Toast.makeText(this@MainActivity, text, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun navigateTo(query: String) {
+        lifecycleScope.launch {
+            speaker.speak("Searching for $query.")
+            val dest = geo.lookupDestination(query)
+            if (dest == null) {
+                if (!Geo.isOnline(this@MainActivity)) {
+                    speaker.speak("I need an internet connection to search for places.")
+                } else {
+                    speaker.speak("I couldn't find $query.")
+                }
+                return@launch
+            }
+            speaker.speak("Found ${dest.name}. Downloading walking route.")
+            val route = geo.fetchRoute(dest)
+            if (route == null) {
+                if (!Geo.isOnline(this@MainActivity)) {
+                    speaker.speak("Navigation needs an internet connection to download the walking route. Everything else works offline.")
+                } else {
+                    speaker.speak("I couldn't get a walking route to ${dest.name}.")
+                }
+                return@launch
+            }
+            activeNav = route
+            show("nav")
+            speaker.speak("Starting navigation to ${dest.name}. Distance ${route.distanceMeters} meters. Walk straight to begin.")
+            navStatus.text = "Navigating to ${dest.name} — ${route.distanceMeters} m"
+            handler.removeCallbacks(navTick)
+            handler.post(navTick)
+        }
+    }
+
+    private val navTick = object : Runnable {
+        override fun run() {
+            val r = activeNav ?: return
+            val loc = geo.lastLocation
+            if (loc == null) {
+                handler.postDelayed(this, 3000)
+                return
+            }
+            val near = geo.isNearTurn(loc, r.steps)
+            if (near != null) {
+                val text = Geo.maneuverText(near)
+                speaker.speak(text)
+                navStatus.text = "Next: $text"
+                handler.postDelayed(this, 15000)
+            } else {
+                handler.postDelayed(this, 3000)
             }
         }
     }
 
     private fun finishNav() {
-        val label = nav?.dest?.label ?: "your destination"
-        speaker.speak("You have arrived near $label. I will stop guiding now.", priority = true)
-        vibrateSosPattern(short = true)
-        navStatus.text = "Arrived."
-        nav = null
+        activeNav = null
+        handler.removeCallbacks(navTick)
+        speaker.speak("You have arrived. Navigation finished.")
+        navStatus.text = "You have arrived."
     }
 
-    private fun stopNavigation(silent: Boolean = false) {
-        if (nav == null && !silent) return
-        nav = null
-        navStatus.text = "Idle."
-        if (!silent) speaker.speak("Navigation stopped.")
-    }
-
-    // ================= camera / vision =================
-    private fun stopCameraAndHome() {
-        camera.stop()
+    private fun stopNavigation() {
+        activeNav = null
+        handler.removeCallbacks(navTick)
+        speaker.speak("Navigation stopped.")
         show("home")
-        speaker.speak("Detection stopped.")
+    }
+
+    private fun stopCameraAndHome() {
+        if (::camera.isInitialized) camera.stop()
+        sonar.stop()
+        show("home")
     }
 
     private fun describeAround() {
-        if (!camera.running) {
-            show("camera")
-            startCamera()
-            handler.postDelayed({ describeAround() }, 5000)
+        val dets = camera.lastSeen
+        val zone = camera.lastZone
+        val sb = StringBuilder()
+        if (dets.isEmpty() && zone == null) {
+            speaker.speak("I don't see any obstacles right now.")
             return
         }
-        val parts = mutableListOf<String>()
-        camera.lastSeen.filter { it.dist != null }
-            .sortedBy { it.dist }
-            .take(3)
-            .forEach { parts.add("${it.label} ${it.side}, ${distWord(it.dist!!)}") }
-        camera.lastZone?.let { parts.add("possible obstacle ahead, ${distWord(it.dist)}") }
-        if (parts.isEmpty()) {
-            speaker.speak("I don't see any obstacles nearby.")
-        } else {
-            speaker.speak("Around you: " + parts.joinToString(". ") + ".")
+        dets.take(5).forEach { d ->
+            val distTxt = d.dist?.let { " %.1f meters".format(it) } ?: ""
+            sb.append("${d.label}$distTxt ${d.side}. ")
         }
+        zone?.let { sb.append("Obstacle ahead ${"%.1f".format(it.dist)} meters. ") }
+        val text = sb.toString().trim()
+        speaker.speak(text)
+        camStatus.text = text
     }
 
+    /** "Read this" — uses the live camera frame cache, NOT PreviewView.getBitmap(). */
     private fun readSign() {
-        if (!camera.running) {
+        val bmp = if (::camera.isInitialized) camera.lastFrame else null
+        if (!::camera.isInitialized || !camera.running || bmp == null) {
             show("camera")
             startCamera()
-            handler.postDelayed({ readSign() }, 3500)
+            handler.postDelayed({ readSign() }, 1500)
             return
         }
-        speaker.speak("Reading\u2026 hold the sign steady.")
+        speaker.speak("Reading… hold it steady.")
+        val snap = Bitmap.createScaledBitmap(bmp, bmp.width, bmp.height, false)
         lifecycleScope.launch {
-            val bmp = try { withContext(Dispatchers.Main) { previewView.bitmap } } catch (e: Exception) { null }
-            if (bmp == null) { speaker.speak("Reading failed. Try again."); return@launch }
-            val text = withContext(Dispatchers.IO) { ocr.read(bmp) }
+            val text = withContext(Dispatchers.IO) { ocr.read(snap) }
             if (text.isNotBlank()) {
-                speaker.speak("It says: $text")
+                lastOcrNorm = normalizeOcr(text)
+                lastOcrAt = System.currentTimeMillis()
+                speaker.speak("It says: " + text.take(200))
                 camStatus.text = "Read: $text"
             } else {
                 speaker.speak("I couldn't read any text here. Try holding the camera steady and closer.")
@@ -456,195 +526,360 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ================= SOS =================
+    /** Periodic sign reading while detection runs: announces NEW text only. */
+    private fun maybeAnnounceSign(text: String) {
+        val norm = normalizeOcr(text)
+        val now = System.currentTimeMillis()
+        if (norm == lastOcrNorm && now - lastOcrAt < 30_000) return
+        lastOcrNorm = norm
+        lastOcrAt = now
+        speaker.speak("Sign says: " + text.take(140))
+    }
+
+    private fun normalizeOcr(text: String) = text.lowercase().filter { it.isLetterOrDigit() }
+
     private fun sosFlow() {
         show("sos")
-        if (prefs.contact.isBlank()) {
-            speaker.speak("No emergency contact set. Please add a phone number in Settings.")
+        if (prefs.contact.isEmpty()) {
+            speaker.speak("No emergency contact set. Please add one in settings.")
+            show("settings")
+        }
+    }
+
+    private fun callContact() {
+        if (prefs.contact.isEmpty()) {
+            speaker.speak("No emergency contact set.")
             return
         }
-        vibrateSosPattern()
-        speaker.speak("SOS ready. Press the big red button to send your location.")
+        try {
+            val i = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${prefs.contact}"))
+            startActivity(i)
+        } catch (e: Exception) {
+            speaker.speak("I couldn't open the phone app.")
+        }
+    }
+
+    private fun smsContact() {
+        if (prefs.contact.isEmpty()) {
+            speaker.speak("No emergency contact set.")
+            return
+        }
+        try {
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse("smsto:${prefs.contact}"))
+            i.putExtra("sms_body", buildSosText())
+            startActivity(i)
+        } catch (e: Exception) {
+            speaker.speak("I couldn't open the messages app.")
+        }
     }
 
     private fun sendSOS() {
-        val p = position
-        if (p == null) {
-            speaker.speak("No location available yet. Wait for the GPS fix, then try again.")
+        val text = buildSosText()
+        if (prefs.contact.isEmpty()) {
+            speaker.speak("No emergency contact set. Please add a contact number in settings.")
+            show("settings")
             return
         }
-        val number = prefs.contact.filter { it.isDigit() || it == '+' }
-        if (number.isBlank()) {
-            speaker.speak("The emergency contact number is not valid. Check Settings.")
-            return
-        }
-        val gmaps = "https://maps.google.com/?q=${p.latitude},${p.longitude}"
-        val body = "EMERGENCY \u2014 I need help. My location: $gmaps " +
-                "(accuracy \u00B1${p.accuracy.roundToInt()} m). Sent via GuideLens."
-        vibrateSosPattern()
-        speaker.speak("Sending SOS with your location.", priority = true)
-        val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$number")).apply {
-            putExtra("sms_body", body)
-        }
-        try { startActivity(intent) } catch (e: Exception) {
-            speaker.speak("No messaging app found on this phone.")
+        try {
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse("smsto:${prefs.contact}"))
+            i.putExtra("sms_body", text)
+            startActivity(i)
+            speaker.speak("Opening messages with your emergency text. Press send.")
+        } catch (e: Exception) {
+            speaker.speak("I couldn't open the messages app.")
         }
     }
 
-    // ================= voice commands =================
-    private fun handleCommand(raw: String) {
-        val t = raw.lowercase().replace(Regex("[.?!]"), "").trim()
-        val m = Regex("(?:navigate|take me|go|walk)(?: to)? (.+)").find(t)
-        when {
-            m != null -> navigateTo(m.groupValues[1].trim())
-            t.contains("where am i") || t.contains("my location") -> whereAmI()
-            t.contains("read") -> readSign()
-            t.contains("around") || t.contains("what do you see") || t.contains("surroundings") -> describeAround()
-            t.contains("stop navigation") || t == "stop" -> stopNavigation()
-            t.contains("repeat") -> speaker.repeat()
-            t.contains("sos") || t.contains("emergency") || t.contains("help me") -> sosFlow()
-            t.contains("setting") -> show("settings")
-            t.contains("start detection") || t.contains("start camera") -> { show("camera"); startCamera() }
-            else -> speaker.speak("Sorry, I didn't understand. Try 'navigate to the library', 'where am I', 'read this', or 'what's around me'.")
+    private fun buildSosText(): String {
+        val loc = geo.lastLocation
+        return if (loc != null) {
+            "I need help! My approximate location: https://maps.google.com/?q=${loc.latitude},${loc.longitude}"
+        } else {
+            "I need help! (location unavailable)"
+        }
+    }
+
+    private fun startListening() {
+        if (recognizer == null) {
+            recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            recognizer?.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {}
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onPartialResults(partialResults: Bundle?) {}
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+
+                override fun onError(error: Int) {
+                    listening = false
+                }
+
+                override fun onEndOfSpeech() {
+                    listening = false
+                }
+
+                override fun onResults(results: Bundle?) {
+                    listening = false
+                    val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    val said = list?.getOrNull(0)
+                    if (said.isNullOrBlank()) {
+                        speaker.speak("Sorry, I didn't catch that.")
+                    } else {
+                        handleCommand(said)
+                    }
+                }
+            })
+        }
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.US)
+            .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        try {
+            listening = true
+            recognizer?.startListening(i)
+        } catch (e: Exception) {
+            listening = false
+        }
+    }
+
+    private fun micPermissionThen(fn: () -> Unit) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            fn()
+        } else {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), REQ_MIC)
         }
     }
 
     override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
-        if (event.keyCode == android.view.KeyEvent.KEYCODE_SPACE &&
-            event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
-            currentFocus !is com.google.android.material.textfield.TextInputEditText) {
-            voice.start()
-            return true
-        }
-        if (event.keyCode == android.view.KeyEvent.KEYCODE_SPACE && event.action == android.view.KeyEvent.ACTION_UP) {
-            voice.stop()
-            return true
+        if (event.action == android.view.KeyEvent.ACTION_DOWN) {
+            when (event.keyCode) {
+                android.view.KeyEvent.KEYCODE_VOLUME_UP -> {
+                    sosFlow()
+                    return true
+                }
+                android.view.KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                    whereAmI()
+                    return true
+                }
+            }
         }
         return super.dispatchKeyEvent(event)
     }
 
-    // ================= settings =================
+    private fun handleCommand(raw: String) {
+        val text = raw.lowercase()
+        when {
+            text.contains("where am i") || text.contains("my location") -> whereAmI()
+            text.contains("navigate") || text.contains("take me") || text.contains("directions to") -> {
+                val dest = text.removePrefix("navigate to").removePrefix("take me to").removePrefix("directions to").trim()
+                if (dest.isEmpty()) {
+                    speaker.speak("Where would you like to go?")
+                } else {
+                    navigateTo(dest)
+                }
+            }
+            text.contains("read") -> readSign()
+            text.contains("stop navigation") -> stopNavigation()
+            text.contains("help") || text.contains("emergency") || text.contains("sos") -> {
+                vibrateSosPattern()
+                sendSOS()
+            }
+            text.contains("describe") -> describeAround()
+            text.contains("camera") || text.contains("obstacle") -> {
+                show("camera")
+                startCamera()
+            }
+            text.contains("battery") -> updateBatteryChip(true)
+            text.contains("repeat") -> speaker.repeat()
+            else -> speaker.speak("You said $text. Try: where am I, navigate to the market, read this, or help.")
+        }
+    }
+
     private fun loadSettingsUI() {
-        findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.chkAudio).isChecked = prefs.audio
-        findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.chkHaptics).isChecked = prefs.haptics
-        findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.chkStepFree).isChecked = prefs.stepFree
-        findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.chkSimple).isChecked = prefs.simple
-        findViewById<RadioButton>(R.id.themeDark).isChecked = prefs.themeDark
-        findViewById<RadioButton>(R.id.themeLight).isChecked = !prefs.themeDark
-        checkVerb(prefs.verbosity)
-        checkSens(prefs.sensitivity)
-        findViewById<Slider>(R.id.setRate).value = prefs.rate
-        findViewById<TextView>(R.id.rateLabel).text = "Speech speed  %.1f\u00D7".format(prefs.rate)
-        findViewById<com.google.android.material.textfield.TextInputEditText>(R.id.setContact).setText(prefs.contact)
-        syncThemeIcon()
+        findViewById<MaterialSwitch>(R.id.swAudio)?.isChecked = prefs.audio
+        findViewById<MaterialSwitch>(R.id.swHaptics)?.isChecked = prefs.haptics
+        findViewById<MaterialSwitch>(R.id.swStepFree)?.isChecked = prefs.stepFree
+        findViewById<MaterialSwitch>(R.id.swSimple)?.isChecked = prefs.simple
+        findViewById<EditText>(R.id.etContact)?.setText(prefs.contact)
+        checkVerb()
+        checkSens()
+        val rate = findViewById<EditText>(R.id.etRate)
+        rate?.setText(prefs.rate.toString())
+        rate?.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                val v = s?.toString()?.toFloatOrNull()
+                if (v != null && v in 0.5f..2.0f) {
+                    prefs.rate = v
+                    speaker.setRate(v)
+                }
+            }
+        })
     }
 
-    private fun checkVerb(v: String) {
-        findViewById<RadioButton>(R.id.verbMinimal).isChecked = v == "minimal"
-        findViewById<RadioButton>(R.id.verbStandard).isChecked = v == "standard"
-        findViewById<RadioButton>(R.id.verbVerbose).isChecked = v == "verbose"
+    private fun checkVerb() {
+        val r = findViewById<LinearLayout>(R.id.rgVerbosity)
+        val id = when (prefs.verbosity) {
+            "full" -> R.id.rbFull
+            "minimal" -> R.id.rbMinimal
+            else -> R.id.rbStandard
+        }
+        (r?.getChildAt(0) as? android.widget.RadioButton)?.isChecked = false
+        findViewById<View>(id)?.let { (it as? android.widget.RadioButton)?.isChecked = true }
+        r?.setOnCheckedChangeListener { _, checkedId ->
+            prefs.verbosity = when (checkedId) {
+                R.id.rbFull -> "full"
+                R.id.rbMinimal -> "minimal"
+                else -> "standard"
+            }
+        }
     }
 
-    private fun checkSens(s: String) {
-        findViewById<RadioButton>(R.id.sensNear).isChecked = s == "near"
-        findViewById<RadioButton>(R.id.sensStandard).isChecked = s == "standard"
-        findViewById<RadioButton>(R.id.sensFar).isChecked = s == "far"
+    private fun checkSens() {
+        val r = findViewById<LinearLayout>(R.id.rgSensitivity)
+        val id = when (prefs.sensitivity) {
+            "near" -> R.id.rbNear
+            "far" -> R.id.rbFar
+            else -> R.id.rbNormal
+        }
+        findViewById<View>(id)?.let { (it as? android.widget.RadioButton)?.isChecked = true }
+        r?.setOnCheckedChangeListener { _, checkedId ->
+            prefs.sensitivity = when (checkedId) {
+                R.id.rbNear -> "near"
+                R.id.rbFar -> "far"
+                else -> "standard"
+            }
+        }
     }
 
     private fun saveSettings() {
-        prefs.audio = findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.chkAudio).isChecked
-        prefs.haptics = findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.chkHaptics).isChecked
-        prefs.stepFree = findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.chkStepFree).isChecked
-        prefs.simple = findViewById<com.google.android.material.materialswitch.MaterialSwitch>(R.id.chkSimple).isChecked
-        prefs.themeDark = findViewById<RadioButton>(R.id.themeDark).isChecked
-        prefs.rate = findViewById<Slider>(R.id.setRate).value
-        prefs.contact = findViewById<com.google.android.material.textfield.TextInputEditText>(R.id.setContact)
-            .text?.toString()?.trim().orEmpty()
-        prefs.verbosity = when {
-            findViewById<RadioButton>(R.id.verbMinimal).isChecked -> "minimal"
-            findViewById<RadioButton>(R.id.verbVerbose).isChecked -> "verbose"
-            else -> "standard"
-        }
-        prefs.sensitivity = when {
-            findViewById<RadioButton>(R.id.sensNear).isChecked -> "near"
-            findViewById<RadioButton>(R.id.sensFar).isChecked -> "far"
-            else -> "standard"
-        }
-        speaker.setRate(prefs.rate)
-        AppCompatDelegate.setDefaultNightMode(
-            if (prefs.themeDark) AppCompatDelegate.MODE_NIGHT_YES else AppCompatDelegate.MODE_NIGHT_NO)
-        syncThemeIcon()
+        prefs.audio = findViewById<MaterialSwitch>(R.id.swAudio)?.isChecked ?: true
+        prefs.haptics = findViewById<MaterialSwitch>(R.id.swHaptics)?.isChecked ?: true
+        prefs.stepFree = findViewById<MaterialSwitch>(R.id.swStepFree)?.isChecked ?: false
+        prefs.simple = findViewById<MaterialSwitch>(R.id.swSimple)?.isChecked ?: false
+        prefs.contact = findViewById<EditText>(R.id.etContact)?.text?.toString()?.trim() ?: ""
         applySimpleMode()
         speaker.speak("Settings saved.")
-        show("home")
     }
 
-    // ================= misc =================
-    private fun updateBatteryChip() {
-        val i: Intent? = if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED), Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("DEPRECATION")
-            registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        }
-        val level = i?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
-        val scale = i?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
-        if (level >= 0 && scale > 0) {
-            battChip.text = " ${(level * 100 / scale)}%"
+    private fun updateBatteryChip(forceSpeak: Boolean = false) {
+        val bm = getSystemService(android.content.Context.BATTERY_SERVICE) as android.os.BatteryManager
+        val pct = bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        findViewById<TextView>(R.id.batteryChip)?.text = "Battery $pct%"
+        if (pct in 0..20 || forceSpeak) {
+            speaker.speak("Battery at $pct percent.")
         }
     }
 
     private fun showDisclaimer() {
-        val msg = "GuideLens is an experimental assistive aid. It helps you notice obstacles, read signs and follow walking routes \u2014 but it cannot replace your white cane, guide dog, or your own judgment.\n\n" +
-                "Always cross roads the way you were trained. The app will never tell you a road is \"safe to cross\" \u2014 it only reports what it sees.\n\n" +
-                "Camera video never leaves your phone. Location is used only when you ask."
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Before you start")
+        if (prefs.agreed) {
+            if (!prefs.tutorialDone) playTutorial()
+            return
+        }
+        val msg = (
+            "Please read carefully:\n\n" +
+            "1) GuideLens is an assistive aid — it cannot replace your white cane, guide dog, or your own judgment.\n\n" +
+            "2) Do not cross roads based solely on this app.\n\n" +
+            "3) Distances and obstacles detection are approximate.\n\n" +
+            "4) Your camera and microphone stay on-device; only location requests go online for maps."
+        )
+        val dlg = com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+            .setTitle("Safety & Privacy")
             .setMessage(msg)
-            .setPositiveButton("I understand \u2014 let's go") { d, _ ->
+            .setPositiveButton("I understand") { d, _ ->
                 prefs.agreed = true
                 d.dismiss()
-                speaker.speak("Great. Hold the green button and say, navigate to, followed by a place.")
+                playTutorial()
             }
             .setCancelable(false)
-            .show()
-        speaker.speak("Welcome to GuideLens. Please listen to the safety information on screen.")
+        dlg.show()
+        speaker.speak("Welcome to GuideLens. Please listen to the safety information on screen, then press I understand.")
     }
 
-    private fun vibrateSosPattern(short: Boolean = false) {
-        val v = AlertCenter.vibratorOf(this) ?: return
-        if (!prefs.haptics) return
-        val pattern = if (short) longArrayOf(60, 80, 60) else longArrayOf(200, 100, 200, 100, 200, 700)
+    /** Spoken onboarding for blind & elderly users — plays once, out loud. */
+    private fun playTutorial() {
+        prefs.tutorialDone = true
+        val steps = listOf(
+            900L to "Let's learn the basics.",
+            4200L to "Hold the phone at chest height, with the camera on the back facing forward, tilted slightly toward the ground. Detection is already running, you don't need to press anything.",
+            12000L to "I will beep faster as obstacles get closer, and tell you what they are. Double-tap anywhere on the screen to repeat my last message.",
+            18500L to "I can't see things above your head, like open cupboards, awnings or tree branches. Always check overhead obstacles with your hand or cane.",
+            25500L to "For your safety, use only one earphone, or a bone conduction headset, so you can still hear traffic and people around you.",
+            32000L to "Hold the big green button and speak to ask for things, like: navigate to the market, where am I, read this, or help.",
+            39000L to "That's it. The volume up button opens S O S, and volume down tells you where you are. GuideLens is now watching for obstacles."
+        )
+        for ((t, msg) in steps) handler.postDelayed({ speaker.speak(msg) }, t)
+    }
+
+    private fun onFallDetected() {
+        vibrateSosPattern()
+        speaker.speak(
+            "I think you may have fallen. Are you okay? Tap anywhere on the screen if you are fine, " +
+            "or I will send an emergency message in 15 seconds.", priority = true
+        )
+        val r = Runnable { sendSOS() }
+        fallCancel = r
+        handler.postDelayed(r, 15_000)
+    }
+
+    private fun cancelFallCountdownIfAny() {
+        val r = fallCancel ?: return
+        handler.removeCallbacks(r)
+        fallCancel = null
+        speaker.speak("Okay. Emergency message cancelled.")
+    }
+
+    fun vibrateSosPattern() {
         try {
             if (Build.VERSION.SDK_INT >= 26) {
-                v.vibrate(android.os.VibrationEffect.createWaveform(pattern, -1))
+                vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 300, 200, 300, 200, 300), -1))
             } else {
                 @Suppress("DEPRECATION")
-                v.vibrate(pattern.sum())
+                vibrator.vibrate(longArrayOf(0, 300, 200, 300, 200, 300), -1)
             }
-        } catch (e: Exception) { }
+        } catch (e: Exception) {
+        }
     }
 
     private fun vibrateLong() {
-        val v = AlertCenter.vibratorOf(this) ?: return
-        if (!prefs.haptics) return
         try {
-            if (Build.VERSION.SDK_INT >= 26) v.vibrate(android.os.VibrationEffect.createWaveform(longArrayOf(300), -1))
-            else { @Suppress("DEPRECATION") v.vibrate(300) }
-        } catch (e: Exception) { }
+            if (Build.VERSION.SDK_INT >= 26) {
+                vibrator.vibrate(VibrationEffect.createOneShot(500, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(500)
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        pocketWatcher.start()
+        fallDetector.start()
+        // auto-restart detection after phone calls / app switching
+        if (cameraStartedOnce && (!::camera.isInitialized || !camera.running)) {
+            startCamera()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        pocketWatcher.stop()
+        fallDetector.stop()
     }
 
     override fun onDestroy() {
-        camera.shutdown()
-        voice.destroy()
-        ocr.close()
-        speaker.shutdown()
         super.onDestroy()
-    }
-
-    companion object {
-        private const val REQ_CAM = 1
-        private const val REQ_MIC = 2
-        private const val REQ_LOC = 3
+        handler.removeCallbacksAndMessages(null)
+        if (::camera.isInitialized) camera.shutdown()
+        sonar.stop()
+        pocketWatcher.stop()
+        fallDetector.stop()
+        try { recognizer?.destroy() } catch (e: Exception) { }
+        speaker.shutdown()
+        geo.stop()
     }
 }

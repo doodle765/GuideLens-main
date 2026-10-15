@@ -24,7 +24,15 @@ import kotlinx.coroutines.launch
 /**
  * Camera + detection pipeline, fully offline:
  * CameraX Preview (live feed) + ImageAnalysis (frame stream) ->
- * COCO-SSD object detection -> tiered alerts -> overlay.
+ * COCO-SSD object detection -> tiered, tracked alerts -> overlay.
+ *
+ * Also:
+ *  - caches a small copy of the latest frame ([lastFrame]) so OCR ("read this"
+ *    and periodic sign-reading) never depends on PreviewView.getBitmap(),
+ *    which returns null on many Xiaomi/MIUI devices (the old "OCR reads only
+ *    once" bug)
+ *  - frame-luminance watchdog: tells the user when the lens is covered or it
+ *    is too dark, instead of silently seeing nothing
  *
  * NOTE: PreviewView.getBitmap() returns null on many Xiaomi/MIUI devices,
  * so frames come from an ImageAnalysis use case instead.
@@ -36,6 +44,7 @@ class CameraController(
     private val prefs: Prefs,
     private val speaker: Speaker,
     private val alerts: AlertCenter,
+    private val sonar: Sonar?,
     private val onStatus: (String) -> Unit
 ) {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -52,6 +61,13 @@ class CameraController(
 
     @Volatile var lastSeen: List<Detector.Detection> = emptyList()
     @Volatile var lastZone: Segmenter.Zone? = null
+
+    /** Small copy of the latest camera frame, for OCR. May be null before the first frame. */
+    @Volatile var lastFrame: Bitmap? = null
+        private set
+
+    private var darkFrames = 0
+    private var darkLatch = false
 
     fun start() {
         if (running) return
@@ -105,6 +121,38 @@ class CameraController(
     private fun processFrame(proxy: ImageProxy) {
         try {
             val bmp = proxy.toBitmapRotated()
+            val luma = luminance(bmp)
+
+            if (luma < DARK_LUMA) {
+                darkFrames++
+                if (darkFrames >= DARK_FRAMES && !darkLatch) {
+                    darkLatch = true
+                    onStatus("Camera covered or too dark — detection paused.")
+                    speaker.speak("It's too dark, or the camera is covered. I can't see anything.", priority = true)
+                }
+            } else {
+                if (darkLatch && luma > RECOVER_LUMA) {
+                    darkLatch = false
+                    speaker.speak("I can see again. Detection resumed.")
+                }
+                darkFrames = 0
+            }
+
+            if (darkLatch) {
+                // can't see: skip inference, reset tracking, quiet the sonar
+                lastSeen = emptyList()
+                lastZone = null
+                lastFrame = null
+                alerts.reset()
+                sonar?.silence()
+                activity.runOnUiThread { overlay.clear() }
+                return
+            }
+
+            // cache a small frame for OCR (read-this button + periodic sign reading)
+            val small = Bitmap.createScaledBitmap(bmp, 480, bmp.height * 480 / bmp.width, true)
+            lastFrame?.recycle()
+            lastFrame = small
 
             val dets = try {
                 detector.detect(bmp)
@@ -119,19 +167,13 @@ class CameraController(
             lastSeen = dets
             lastZone = zone
 
-            // spoken alerts
+            // tracked spoken alerts + sonar feed
+            alerts.onFrame(dets, zone, sonar)
+
             var anyDanger = false
-            for (d in dets) {
-                val dist = d.dist ?: continue
-                alerts.alert(d.label, d.side, dist)
-                if (dist <= 3f) anyDanger = true
-            }
-            zone?.let { z ->
-                if (System.currentTimeMillis() > alerts.namedDangerUntil) {
-                    alerts.alert("obstacle", "ahead", z.dist)
-                    if (z.dist <= 3f) anyDanger = true
-                }
-            }
+            for (d in dets) if ((d.dist ?: 99f) <= 3f) anyDanger = true
+            if ((zone?.dist ?: 99f) <= 3f) anyDanger = true
+            if (anyDanger) activity.runOnUiThread { onStatus("Stop! Obstacle ahead.") }
 
             // overlay: scale detection coordinates to the overlay view size
             val ow = overlay.width.takeIf { it > 0 } ?: bmp.width
@@ -152,12 +194,28 @@ class CameraController(
                     sev
                 )
             }
-            overlay.update(boxes, zone)
-            if (anyDanger) activity.runOnUiThread { onStatus("Stop! Obstacle ahead.") }
+            activity.runOnUiThread { overlay.update(boxes, zone) }
         } catch (e: Exception) {
             reportOnce("frame", e)
         } finally {
             proxy.close()
+        }
+    }
+
+    /** Mean luminance 0..1 from a heavily downscaled copy of the frame. */
+    private fun luminance(bmp: Bitmap): Float {
+        return try {
+            val tiny = Bitmap.createScaledBitmap(bmp, 32, 18, true)
+            val px = IntArray(tiny.width * tiny.height)
+            tiny.getPixels(px, 0, tiny.width, 0, 0, tiny.width, tiny.height)
+            tiny.recycle()
+            var sum = 0L
+            for (p in px) {
+                sum += ((p shr 16 and 0xFF) + (p shr 8 and 0xFF) + (p and 0xFF)) / 3
+            }
+            sum.toFloat() / px.size / 255f
+        } catch (e: Exception) {
+            1f   // if measurement fails, keep detecting
         }
     }
 
@@ -175,6 +233,9 @@ class CameraController(
         try { provider?.unbindAll() } catch (e: Exception) { }
         lastSeen = emptyList()
         lastZone = null
+        lastFrame?.recycle()
+        lastFrame = null
+        alerts.reset()
         overlay.clear()
     }
 
@@ -182,9 +243,14 @@ class CameraController(
         stop()
         inferenceExecutor.shutdown()
     }
+
+    companion object {
+        private const val DARK_LUMA = 0.035f      // below: covered / very dark
+        private const val RECOVER_LUMA = 0.09f    // hysteresis so it doesn't flap
+        private const val DARK_FRAMES = 25        // ~2-3 s of dark frames before warning
+    }
 }
 
-/** YUV_420_888 -> upright Bitmap (NV21 -> JPEG -> rotate to display orientation). */
 /** YUV_420_888 -> upright Bitmap with correct chroma handling (no color swap). */
 private fun ImageProxy.toBitmapRotated(): Bitmap {
     val yP = planes[0]

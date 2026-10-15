@@ -9,6 +9,15 @@ mirroring the GuideLens PWA: same screens, same voice-first flow, same distance-
 **Everything works fully offline except reverse-geocoding ("Where am I?") and walking-route**
 **download, which need internet** — and both fail gracefully with a _spoken_ message.
 
+## What's new in 1.2 (blind/elderly usability)
+
+- **Detection starts by itself** — no button needed; it also restarts after interruptions.
+- **Sonar beeps**: faster/higher as obstacles approach, panned to their side — instant feedback that never gets stuck behind speech.
+- **Anti-spam alerts**: objects to your side or moving away stay quiet; static obstacles repeat at most every 15 s; you hear "Path clear" when something close disappears.
+- **Sign reading while walking**: new text is announced as "Sign says: …" (and the "read this" bug is fixed).
+- **Spoken tutorial** on first launch, **double-tap to repeat**, **pocket pause**, **dark/covered-lens warnings**, **experimental fall detection**.
+- TTS speaks **Urdu automatically** on Urdu-language devices.
+
 ## Screenshots
 
 <!-- TODO: replace with real captures. A short screen-recording of obstacle
@@ -101,14 +110,17 @@ app/src/main/java/com/guidelens/app/
   Detector.kt         COCO-SSD TFLite wrapper + monocular distance estimate
   Segmenter.kt        optional DeepLab cityscapes zones (poles/walls/fences)
   OverlayView.kt      bounding boxes + danger-zone canvas
-  AlertCenter.kt      Android shell: executes AlertPolicy decisions (TTS + buzz)
-  AlertPolicy.kt      pure, unit-tested tier/throttle decisions (no Android deps)
+  AlertCenter.kt      executes AlertPolicy decisions per frame (TTS + buzz + sonar)
+  AlertPolicy.kt      pure, unit-tested tiers, tracking, anti-spam decisions
+  Sonar.kt            beep/heartbeat earcon channel (in-memory, stereo-panned)
+  FallDetector.kt     EXPERIMENTAL fall detection (impact + stillness heuristic)
+  PocketWatcher.kt    proximity-based pocket pause
   Speaker.kt          TextToSpeech wrapper
   VoiceController.kt  hold-to-talk offline speech recognition
   Geo.kt              geocoding, OSRM routing, polyline decode, "Where am I"
   OcrReader.kt        ML Kit offline OCR
   Prefs.kt            settings storage
-  SafetyDisclaimer.kt one-time in-app safety disclaimer (first launch)
+  (first-launch safety disclaimer: showDisclaimer() in MainActivity.kt)
 ```
 
 ## Honest limitations (safety-critical — read this)
@@ -122,6 +134,9 @@ app/src/main/java/com/guidelens/app/
   traffic light=6, traffic sign=7).
 - The "Prefer step-free routes" setting is stored but not applied (OSRM foot profile has
   no step-free flag).
+- The camera at chest height cannot see **overhead obstacles** (open cupboards,
+  awnings, tree branches) — the tutorial and first-run disclaimer say this out loud.
+- Fall detection is a heuristic safety net, not a guarantee.
 - **GuideLens is a complement to your cane or guide dog, never a replacement.**
   This is a working prototype, not a certified safety device. The same warning is shown
   in-app on first launch.

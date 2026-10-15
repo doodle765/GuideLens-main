@@ -1,66 +1,54 @@
-GUIDELENS FIX PACK — how to apply
-=================================
-This pack contains every file from the improvement review. Paths inside the
-pack mirror the repository, so each file maps 1:1 to where it belongs.
+GUIDELENS FIX PACK — v1.2 (blind/elderly usability overhaul)
 
-REPLACE (overwrite the existing file):
+Apply on top of a project that already has v1.1 applied (or merge everything at
+once — this pack contains ALL files, updated).
+
+REPLACE (overwrite existing files):
   README.md
+  CHANGELOG.md
   .gitignore
   app/build.gradle
   app/proguard-rules.pro
   .github/workflows/build.yml
+  app/src/main/java/com/guidelens/app/AlertPolicy.kt
   app/src/main/java/com/guidelens/app/AlertCenter.kt
-  app/src/main/java/com/guidelens/app/Detector.kt
-  app/src/main/res/mipmap-mdpi/ic_launcher.png
-  app/src/main/res/mipmap-mdpi/ic_launcher_round.png
-  app/src/main/res/mipmap-hdpi/ic_launcher.png
-  app/src/main/res/mipmap-hdpi/ic_launcher_round.png
-  app/src/main/res/mipmap-xhdpi/ic_launcher.png
-  app/src/main/res/mipmap-xhdpi/ic_launcher_round.png
-  app/src/main/res/mipmap-xxhdpi/ic_launcher.png
-  app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png
-  app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-  app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png
+  app/src/main/java/com/guidelens/app/Speaker.kt
+  app/src/main/java/com/guidelens/app/CameraController.kt
+  app/src/main/java/com/guidelens/app/MainActivity.kt
+  app/src/main/java/com/guidelens/app/Prefs.kt
+  app/src/test/java/com/guidelens/app/AlertPolicyTest.kt
+  app/src/main/res/mipmap-*/ic_launcher*.png   (if you have not copied them yet)
 
 NEW (copy into the repo):
-  LICENSE
-  CHANGELOG.md
-  CONTRIBUTING.md
-  CODE_OF_CONDUCT.md
-  SECURITY.md
-  .github/ISSUE_TEMPLATE/bug_report.md
-  .github/ISSUE_TEMPLATE/feature_request.md
-  .github/ISSUE_TEMPLATE/config.yml
-  .github/PULL_REQUEST_TEMPLATE.md
-  app/src/main/java/com/guidelens/app/AlertPolicy.kt
-  app/src/main/java/com/guidelens/app/SafetyDisclaimer.kt
-  app/src/test/java/com/guidelens/app/AlertPolicyTest.kt
+  LICENSE  CHANGELOG.md  CONTRIBUTING.md  CODE_OF_CONDUCT.md  SECURITY.md
+  .github/ISSUE_TEMPLATE/*  .github/PULL_REQUEST_TEMPLATE.md
+  app/src/main/java/com/guidelens/app/Sonar.kt
+  app/src/main/java/com/guidelens/app/FallDetector.kt
+  app/src/main/java/com/guidelens/app/PocketWatcher.kt
   app/src/test/java/com/guidelens/app/DetectorMathTest.kt
   app/src/test/java/com/guidelens/app/GeoTest.kt
 
-DELETE from the repo (leftover artifact, intentionally not shipped here):
+DELETE from the repo (if still present):
   summary_raw.md
 
-ONE-LINE WIRING (manual):
-  In MainActivity.onCreate, before setContentView(...), add:
-      SafetyDisclaimer.showOnce(this)
+NO MANUAL WIRING NEEDED — everything is wired in MainActivity/CameraController.
+No AndroidManifest.xml changes are required (accelerometer/proximity need no
+permissions; keep-screen-on uses a window flag).
 
 THEN VERIFY:
-  ./gradlew testDebugUnitTest     # 20+ unit tests must pass
-  ./gradlew lint assembleDebug
+  ./gradlew.bat testDebugUnitTest     (40 tests)
+  ./gradlew.bat lint assembleDebug
 
-NOT DONE IN THIS PACK (needs hands-on work — listed in CHANGELOG):
-  - Extracting hardcoded strings to strings.xml (+ Urdu locale)
-  - Splitting MainActivity.kt / activity_main.xml by screen
-  - Full TalkBack pass (contentDescriptions, focus order)
-  - Enabling R8/minification on release (keep-rules shipped in proguard-rules.pro)
+NOT DONE (needs hands-on device work, listed in CHANGELOG):
+  - Foreground service for screen-off detection
+  - strings.xml extraction / Urdu UI text
+  - TalkBack pass on the layouts
+  - Enabling R8 on release
 
-Notes:
-- app/build.gradle bumps versionCode 1 -> 2, versionName 1.0 -> 1.1.0.
-- Behavior changes vs. the old code are limited to two deliberate fixes:
-  (1) negative distances can no longer trigger a "Stop!" alert,
-  (2) .tflite assets are kept uncompressed in the APK (required by the
-      openFd() + memory mapping in Detector.kt — previously a latent crash
-      depending on aapt compression).
-- AlertCenter behavior is otherwise identical; all decisions now come from
-  the pure, unit-tested AlertPolicy.
+IMPORTANT NOTES:
+  - Fall detection is EXPERIMENTAL — expect some false alarms (e.g. dropping
+    the phone hard). It only arms a 15-second spoken countdown; nothing is
+    sent unless the user doesn't touch the screen.
+  - The sonar beeps use STREAM_NOTIFICATION; volume follows the notification
+    volume on the device.
+  - If the app feels too chatty still, set verbosity to "minimal" in settings.

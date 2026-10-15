@@ -44,4 +44,9 @@ class Prefs(context: Context) {
     var agreed: Boolean
         get() = sp.getBoolean("agreed", false)
         set(v) { sp.edit().putBoolean("agreed", v).apply() }
+
+    /** Whether the spoken onboarding tutorial has played. */
+    var tutorialDone: Boolean
+        get() = sp.getBoolean("tutorialDone", false)
+        set(v) { sp.edit().putBoolean("tutorialDone", v).apply() }
 }

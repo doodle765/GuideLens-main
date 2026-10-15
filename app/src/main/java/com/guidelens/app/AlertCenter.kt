@@ -6,12 +6,12 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 
 /**
- * Distance-tiered spoken + vibration alerts, mirroring the web app.
+ * Executes the pure, unit-tested decisions of [AlertPolicy] on Android:
+ * speech, vibration and the sonar beep channel.
  *
- * All timing / threshold / throttling decisions live in the pure,
- * unit-tested [AlertPolicy]; this class is only the Android shell that
- * executes them (TextToSpeech + vibrator). Settings are re-read on every
- * alert so live changes apply immediately, as before.
+ * Fed once per camera frame via [onFrame]. The policy's tracking rules mean
+ * static or receding obstacles no longer get a running commentary, and the
+ * user hears "Path clear" when something close disappears.
  */
 class AlertCenter(
     private val speaker: Speaker,
@@ -22,6 +22,44 @@ class AlertCenter(
 
     var namedDangerUntil: Long = 0
         private set
+
+    @Volatile private var muted = false
+    fun setMuted(m: Boolean) { muted = m }
+
+    /** Forget all tracked obstacles (camera covered / pocketed / restarted). */
+    fun reset() = policy.reset()
+
+    fun onFrame(dets: List<Detector.Detection>, zone: Segmenter.Zone?, sonar: Sonar?) {
+        val now = System.currentTimeMillis()
+        policy.sensitivity = prefs.sensitivity
+        policy.verbosity = prefs.verbosity
+
+        var nearest: Float? = null
+        var pan = 0f
+        for (d in dets) {
+            val dist = d.dist ?: continue
+            if (nearest == null || dist < nearest) { nearest = dist; pan = panOf(d.side) }
+            for (say in policy.evaluate(d.label, d.side, dist, now)) deliver(say)
+        }
+        if (zone != null && now > namedDangerUntil) {
+            if (nearest == null || zone.dist < nearest) { nearest = zone.dist; pan = 0f }
+            for (say in policy.evaluate("obstacle", "ahead", zone.dist, now)) deliver(say)
+        }
+        for (say in policy.tick(now)) deliver(say)
+
+        sonar?.let { s ->
+            s.urgency = if (muted || !prefs.audio) 0f
+                        else nearest?.let { policy.urgency(it) } ?: 0f
+            s.pan = pan
+        }
+    }
+
+    private fun deliver(ev: AlertPolicy.Say) {
+        if (muted) return
+        speaker.speak(ev.text, priority = ev.priority)
+        if (ev.priority) namedDangerUntil = System.currentTimeMillis() + 3000
+        ev.buzz?.let { buzz(it) }
+    }
 
     private fun buzz(pattern: LongArray) {
         if (!prefs.haptics || vibrator == null) return
@@ -35,22 +73,13 @@ class AlertCenter(
         } catch (e: Exception) { }
     }
 
-    fun alert(name: String, side: String, dist: Float) {
-        policy.sensitivity = prefs.sensitivity
-        policy.verbosity = prefs.verbosity
-        val decision = policy.evaluate(name, side, dist, System.currentTimeMillis())
-        val text = decision.phrase ?: return
-
-        if (decision.tier == AlertPolicy.Tier.STOP) {
-            speaker.speak(text, priority = true)
-            namedDangerUntil = System.currentTimeMillis() + 3000
-        } else {
-            speaker.speak(text)
-        }
-        decision.buzz?.let { buzz(it) }
-    }
-
     companion object {
+        internal fun panOf(side: String): Float = when {
+            side.startsWith("on your left") -> -0.8f
+            side.startsWith("on your right") -> 0.8f
+            else -> 0f
+        }
+
         fun vibratorOf(context: Context): Vibrator? =
             try {
                 @Suppress("DEPRECATION")
